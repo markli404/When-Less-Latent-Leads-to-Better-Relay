@@ -49,6 +49,9 @@ class ModelWrapper:
         self.model_name = model_name
         self.device = device
         self.args = args
+        self.latent_space_realign = bool(getattr(args, "latent_space_realign", False)) if args else False
+        self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.pre_aligned = None
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
@@ -65,6 +68,80 @@ class ModelWrapper:
         self.model.to(device).eval()
         if hasattr(self.model.config, "use_cache"):
             self.model.config.use_cache = True
+
+    def _build_latent_realign_matrix(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        if output_embeds is None:
+            output_embeds = getattr(model, "lm_head", None)
+        if (
+            input_embeds is None
+            or output_embeds is None
+            or not hasattr(input_embeds, "weight")
+            or not hasattr(output_embeds, "weight")
+        ):
+            raise RuntimeError("Cannot build latent realignment matrix: embedding weights not accessible.")
+
+        input_weight = input_embeds.weight.detach().to(device=device, dtype=torch.float32)
+        output_weight = output_embeds.weight.detach().to(device=device, dtype=torch.float32)
+        gram = torch.matmul(output_weight.T, output_weight)
+        reg = 1e-5 * torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+        gram = gram + reg
+        rhs = torch.matmul(output_weight.T, input_weight)
+        realign_matrix = torch.linalg.solve(gram, rhs)
+        target_norm = input_weight.norm(dim=1).mean().detach()
+
+        # Match the old behavior: even when realignment is disabled, keep norm alignment.
+        if not self.latent_space_realign:
+            realign_matrix = torch.eye(
+                realign_matrix.shape[0],
+                device=realign_matrix.device,
+                dtype=realign_matrix.dtype,
+            )
+
+        return realign_matrix, target_norm
+
+    def _ensure_latent_realign_matrix(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = id(model)
+        info = self._latent_realign_matrices.get(key)
+        target_device = torch.device(device)
+
+        if info is None:
+            matrix, target_norm = self._build_latent_realign_matrix(model, target_device)
+        else:
+            matrix, target_norm = info
+            if matrix.device != target_device:
+                matrix = matrix.to(target_device)
+
+        if isinstance(target_norm, torch.Tensor):
+            target_norm = target_norm.to(device=target_device, dtype=matrix.dtype)
+        else:
+            target_norm = torch.as_tensor(target_norm, device=target_device, dtype=matrix.dtype)
+
+        self._latent_realign_matrices[key] = (matrix, target_norm)
+        return matrix, target_norm
+
+    def _apply_latent_realignment(
+        self,
+        hidden: torch.Tensor,
+        model: torch.nn.Module,
+    ) -> torch.Tensor:
+        matrix, target_norm = self._ensure_latent_realign_matrix(model, hidden.device)
+        hidden_fp32 = hidden.to(torch.float32)
+        aligned = torch.matmul(hidden_fp32, matrix)
+
+        aligned_norm = aligned.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        self.pre_aligned = aligned.detach().clone()
+        aligned = aligned * (target_norm / aligned_norm)
+        return aligned.to(hidden.dtype)
 
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
@@ -233,7 +310,8 @@ class ModelWrapper:
             # Extend full attention mask by 1 real token
             full_mask = torch.cat([full_mask, torch.ones((B, 1), dtype=torch.long, device=device)], dim=-1)
 
-            latent_embed = last_hidden.unsqueeze(1)
+            latent_vec = self._apply_latent_realignment(last_hidden, self.model)
+            latent_embed = latent_vec.unsqueeze(1)
             if hasattr(self.model, "dtype"):
                 latent_embed = latent_embed.to(dtype=self.model.dtype)
 
