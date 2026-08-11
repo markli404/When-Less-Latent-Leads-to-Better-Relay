@@ -55,6 +55,10 @@ class ModelWrapper:
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
+        # Keep batched prefill equivalent to single-sample prefill. The rest of
+        # this code assumes real prompt tokens occupy the left prefix and padding
+        # is appended only for batch alignment.
+        self.tokenizer.padding_side = "right"
 
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -95,7 +99,6 @@ class ModelWrapper:
         realign_matrix = torch.linalg.solve(gram, rhs)
         target_norm = input_weight.norm(dim=1).mean().detach()
 
-        # Match the old behavior: even when realignment is disabled, keep norm alignment.
         if not self.latent_space_realign:
             realign_matrix = torch.eye(
                 realign_matrix.shape[0],
@@ -223,6 +226,49 @@ class ModelWrapper:
         next_token = sorted_idx.gather(-1, sampled_in_sorted)
         return next_token
 
+    @staticmethod
+    def _last_valid_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Return the physical index of the last real token in each padded row.
+
+        This must not assume left or right padding. Using valid_len - 1 is only
+        correct for right padding and changes semantics when tokenizer padding
+        side differs across model/tokenizer configs.
+        """
+        B, L = attention_mask.shape
+        positions = torch.arange(L, device=attention_mask.device).unsqueeze(0).expand(B, -1)
+        masked_positions = torch.where(
+            attention_mask.bool(),
+            positions,
+            torch.zeros_like(positions),
+        )
+        return masked_positions.max(dim=1).values
+
+    @staticmethod
+    def _build_position_ids(pos_cursor: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Build logical position ids for a padded prompt window.
+
+        Real tokens get positions based on their ordinal index among real tokens,
+        starting from pos_cursor (per-sample). This keeps bs=1 and bs>1 numerically
+        equivalent for every REAL token.
+
+        Padding tokens are assigned unique sequential positions (no collision with
+        real tokens, no collision across pads). This choice is safer than pinning
+        pads to position 0 because:
+          - with D2 enabled, pad KVs are masked out everywhere, so their positions
+            never enter any real-token score computation anyway;
+          - giving pads distinct positions avoids any accidental RoPE collision
+            if downstream code ever fails to apply the pad mask.
+        """
+        real_offsets = attention_mask.to(torch.long).cumsum(dim=1) - 1
+        real_offsets = real_offsets.clamp(min=0)
+        position_ids = pos_cursor.unsqueeze(1) + real_offsets
+        # Intentionally NOT zeroing pad positions. Pads keep the sequential id they
+        # land on — harmless because they are masked out of attention, and avoids
+        # sharing position 0 with the first real token.
+        return position_ids
+
     from typing import Any, Optional, Tuple, List
     import torch
 
@@ -247,8 +293,13 @@ class ModelWrapper:
             pos_cursor: torch.Tensor,  # (B,) absolute pos for first REAL token in this prompt window
             latent_steps: int,
             past_key_values: Optional[Any] = None,
-    ) -> Tuple[Any, List[List[torch.Tensor]], torch.Tensor]:
+            past_attention_mask: Optional[torch.Tensor] = None,  # (B, past_len) 0/1, real-vs-pad for prior KV
+    ) -> Tuple[Any, List[List[torch.Tensor]], torch.Tensor, torch.Tensor]:
         """
+        Hard eviction changes KV length without preserving the original logical
+        position timeline, so we must carry positions explicitly instead of
+        inferring them from the current cache size.
+
         - Uses full 2D attention_mask with length (past_len + cur_len [+ steps]).
         - position_ids are computed from pos_cursor (pads get 0).
         - Latent steps are generated in a for-loop.
@@ -276,19 +327,30 @@ class ModelWrapper:
             attention_mask = (attention_mask > 0).to(torch.long).to(device)
 
         valid_len = attention_mask.sum(dim=-1).to(torch.long)  # (B,)
-        last_valid_idx = (valid_len - 1).clamp(min=0)  # (B,)
+        last_valid_idx = self._last_valid_indices(attention_mask)  # (B,)
 
         past_len = _past_length(past_key_values)
         if past_len > 0:
-            past_mask = torch.ones((B, past_len), dtype=torch.long, device=device)
+            # Correctness mode: use the real past-KV mask when supplied so padding
+            # KV entries from prior agents are fully masked out of this agent's
+            # attention. Fall back to all-ones only when the mask is absent or
+            # length-mismatched (e.g. after a pruning compressor changed KV length,
+            # in which case we can no longer map the tracked mask 1-to-1).
+            if (
+                past_attention_mask is not None
+                and past_attention_mask.dim() == 2
+                and past_attention_mask.size(0) == B
+                and past_attention_mask.size(1) == past_len
+            ):
+                past_mask = (past_attention_mask.to(device=device, dtype=torch.long) > 0).to(torch.long)
+            else:
+                past_mask = torch.ones((B, past_len), dtype=torch.long, device=device)
             full_mask = torch.cat([past_mask, attention_mask], dim=-1)  # (B, past_len + L)
         else:
             full_mask = attention_mask  # (B, L)
 
         pos_cursor = pos_cursor.to(device=device, dtype=torch.long)
-        token_pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
-        prompt_pos_ids = pos_cursor.unsqueeze(1) + token_pos  # (B, L)
-        prompt_pos_ids = torch.where(attention_mask.bool(), prompt_pos_ids, torch.zeros_like(prompt_pos_ids))
+        prompt_pos_ids = self._build_position_ids(pos_cursor, attention_mask)  # (B, L)
 
         out = self.model(
             input_ids=input_ids,
@@ -303,6 +365,9 @@ class ModelWrapper:
 
         last_hidden = out.hidden_states[-1][torch.arange(B, device=device), last_valid_idx, :]  # (B, H)
 
+        # Per-sample advancement: latent timeline follows REAL content length,
+        # not padded L. Padding positions are collision-safe because past KVs
+        # at those slots are masked via past_attention_mask in the next agent.
         base_latent_pos = pos_cursor + valid_len  # (B,)
         all_steps_attentions: List[List[torch.Tensor]] = []
 
@@ -334,7 +399,10 @@ class ModelWrapper:
             all_steps_attentions.append(step_attn)
 
         new_pos_cursor = base_latent_pos + int(latent_steps)
-        return past, all_steps_attentions, new_pos_cursor
+        # full_mask now has length (past_len + L + latent_steps); pass it back so
+        # the next agent preserves real-vs-pad information for this KV cache.
+        new_past_attention_mask = full_mask
+        return past, all_steps_attentions, new_pos_cursor, new_past_attention_mask
 
     @torch.no_grad()
     def generate_text_batch(
@@ -347,8 +415,13 @@ class ModelWrapper:
         temperature: float = 0.7,
         top_p: float = 0.95,
         past_key_values: Optional[Any] = None,
+        past_attention_mask: Optional[torch.Tensor] = None,  # (B, past_len) 0/1, real-vs-pad for prior KV
     ) -> Tuple[List[str], Any, torch.Tensor, List]:
         """
+        We decode with an explicit for-loop because hard eviction can make
+        retained KV length differ from the original logical token positions.
+        position_ids therefore must follow pos_cursor, not cache length.
+
         Text decoding with a for-loop.
         Uses full 2D attention_mask with length (past_len + cur_len [+ steps]).
         Returns:
@@ -375,18 +448,26 @@ class ModelWrapper:
             attention_mask = (attention_mask > 0).to(torch.long).to(device)
 
         valid_len = attention_mask.sum(dim=-1).to(torch.long)
-        last_valid_idx = (valid_len - 1).clamp(min=0)
+        last_valid_idx = self._last_valid_indices(attention_mask)
 
         past_len = _past_length(past_key_values)
         if past_len > 0:
-            past_mask = torch.ones((B, past_len), dtype=torch.long, device=device)
+            # Correctness mode: real past-KV mask when supplied; fallback to ones
+            # only when missing or length-mismatched (e.g. after pruning compressor).
+            if (
+                past_attention_mask is not None
+                and past_attention_mask.dim() == 2
+                and past_attention_mask.size(0) == B
+                and past_attention_mask.size(1) == past_len
+            ):
+                past_mask = (past_attention_mask.to(device=device, dtype=torch.long) > 0).to(torch.long)
+            else:
+                past_mask = torch.ones((B, past_len), dtype=torch.long, device=device)
             full_mask = torch.cat([past_mask, attention_mask], dim=-1)      # (B, past_len + L)
         else:
             full_mask = attention_mask                                      # (B, L)
 
-        token_pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
-        prompt_pos_ids = pos_cursor.unsqueeze(1) + token_pos
-        prompt_pos_ids = torch.where(attention_mask.bool(), prompt_pos_ids, torch.zeros_like(prompt_pos_ids))
+        prompt_pos_ids = self._build_position_ids(pos_cursor, attention_mask)
 
         out = self.model(
             input_ids=input_ids,
@@ -399,6 +480,9 @@ class ModelWrapper:
         past = out.past_key_values
 
         logits = out.logits[torch.arange(B, device=device), last_valid_idx, :]  # (B,V)
+        # Per-sample advancement: decoding timeline follows REAL content length,
+        # not padded L. Padding KV positions are collision-safe because they
+        # are masked via past_attention_mask in any subsequent attention.
         decode_base_pos = pos_cursor + valid_len                                 # (B,)
 
         eos_id = self.tokenizer.eos_token_id
@@ -477,4 +561,3 @@ class ModelWrapper:
 
         new_pos_cursor = decode_base_pos + steps_done
         return generations, past, new_pos_cursor, gen_lens.detach().cpu().tolist()
-

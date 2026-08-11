@@ -8,7 +8,7 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class LOBF(BaseKVCompressor):
+class LOBFNaive(BaseKVCompressor):
     """
     PCA extra-subspace injection on V:
       - Keep prompt top-k tokens (excluding sink) by aggregated attention.
@@ -331,11 +331,11 @@ class LOBF(BaseKVCompressor):
             recovery_R = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             recovery_cos = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             pca_evr = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
+            pca_cum_evr = torch.full((B, H_kv, D), float("nan"), device=layer_device, dtype=torch.float32)
             ub_res_pca = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             ad_over_as = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             inj_norm = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             rank_used = torch.zeros((B, H_kv), device=layer_device, dtype=torch.float32)
-            pca_cum_evr = torch.full((B, H_kv, D), float("nan"), device=layer_device, dtype=torch.float32)
 
             # Slice KV, then inject into kept prompt V
             prompt_kept_offset = L_history + sink_len_common
@@ -408,7 +408,8 @@ class LOBF(BaseKVCompressor):
 
                     # Project Yc onto span(Xc)
                     Yproj = (Yc @ Q) @ Q.t()
-                    R = Yc - Yproj  # (nd, D)
+                    # TODO: Change start!!!
+                    R = Yc # - Yproj  # (nd, D)
 
                     # resid_energy is used both for the r_perp metric and the
                     # downstream edge-case gate, so keep it on the real path.
@@ -430,9 +431,9 @@ class LOBF(BaseKVCompressor):
                     if resid_energy.item() <= 1e-10:
                         _mt = time.time()
                         pca_evr[b, h] = 0.0
+                        pca_cum_evr[b, h, :] = 1.0
                         ub_res_pca[b, h] = 0.0
                         inj_norm[b, h] = 0.0
-                        pca_cum_evr[b, h, :] = 1.0
                         metric_time += time.time() - _mt
                         continue
 
@@ -443,7 +444,8 @@ class LOBF(BaseKVCompressor):
                     except RuntimeError:
                         continue
 
-                    p = min(self.pca_rank, int(Vh.shape[0]))
+                    # TODO: Change start!!!
+                    p = int(Vh.shape[0]) # min(self.pca_rank, int(Vh.shape[0]))
                     if p <= 0:
                         continue
 
@@ -483,7 +485,9 @@ class LOBF(BaseKVCompressor):
                     delta = coeff @ C          # (D,)
 
                     # Apply per-head scale (Ad/As or other)
-                    delta = delta * scale[h]
+                    # TODO: Change start!!!
+
+                    delta = delta # * scale[h]
 
                     delta_all[h] = delta
                     _mt = time.time()

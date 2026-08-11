@@ -59,15 +59,15 @@ class Headwise(BaseKVCompressor):
         current_full_mask: Optional[Any] = None,   # ignored
         debug: bool = False,
         **kwargs,
-    ) -> Tuple[Any, float]:
+    ) -> Tuple[Any, float, Any]:
         t0 = time.time()
 
         if past_key_values is None:
-            return None, 0.0
+            return None, 0.0, None
 
         layers = self._as_legacy_tuple(past_key_values)
         if len(layers) == 0:
-            return past_key_values, 0.0
+            return past_key_values, 0.0, None
 
         k0, _ = layers[0]
         B = int(k0.shape[0])
@@ -97,6 +97,7 @@ class Headwise(BaseKVCompressor):
         apply_sink = (not getattr(self, "_has_kept_sink", False)) and (self.sink_size > 0)
 
         new_layers: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        selected_position_matrices: List[List[List[List[int]]]] = []
 
         for layer_idx in range(num_layers):
             k, v = layers[layer_idx]
@@ -248,6 +249,14 @@ class Headwise(BaseKVCompressor):
             new_k = torch.gather(k, dim=2, index=idx_exp)
             new_v = torch.gather(v, dim=2, index=idx_exp)
 
+            layer_selection: List[List[List[int]]] = []
+            for b in range(B):
+                layer_selection.append([
+                    [int(x) for x in selected_prompt_idx[b][h].detach().cpu().tolist()]
+                    for h in range(H_kv)
+                ])
+
+            selected_position_matrices.append(layer_selection)
             new_layers.append((new_k, new_v))
 
             if debug and layer_idx == 0:
@@ -260,5 +269,12 @@ class Headwise(BaseKVCompressor):
         if apply_sink:
             self._has_kept_sink = True
 
+        selection_metadata = {
+            "selected_prompt_positions_matrix": [
+                [selected_position_matrices[layer_idx][b] for layer_idx in range(num_layers)]
+                for b in range(B)
+            ]
+        }
+
         new_cache = DynamicCache.from_legacy_cache(tuple(new_layers))
-        return new_cache, time.time() - t0
+        return new_cache, time.time() - t0, selection_metadata

@@ -114,13 +114,13 @@ class GenerationOnly(BaseKVCompressor):
         latent_steps: int,
         prompt_mask: Optional[torch.Tensor] = None,
         all_steps_attentions: List[List[torch.Tensor]],
-    ) -> tuple[Any, float]:
+    ) -> tuple[Any, float, Any]:
         t0 = time.time()
 
         device = _get_cache_device(past_key_values)
 
         if past_key_values is None:
-            return DynamicCache(), 0.0
+            return DynamicCache(), 0.0, None
 
         # steps must be exactly the number of generation tokens appended before compress
         L = _past_length(past_key_values)
@@ -170,4 +170,4 @@ class GenerationOnly(BaseKVCompressor):
         merged = _merge_intervals(intervals, L)
         trimmed = _concat_slices(past_key_values, merged)
 
-        return trimmed, time.time() - t0
+        return trimmed, time.time() - t0, None

@@ -8,17 +8,12 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class HOBF(BaseKVCompressor):
+class HOBFMaxP(BaseKVCompressor):
     """
-    HOBF with metric collection.
+    HOBF max-p variant with metric collection.
 
-    This mirrors HOBF behavior while additionally returning per-layer tensors for:
-      - r_perp
-      - recovery_R
-      - recovery_cos
-      - pca_evr
-      - ad_over_as
-      - inj_norm
+    This mirrors HOBFMetric but uses the maximum available PCA rank
+    instead of truncating to self.pca_rank.
     """
 
     def __init__(
@@ -341,8 +336,6 @@ class HOBF(BaseKVCompressor):
                         Yproj = (Yc @ Q) @ Q.t()
                         R = Yc - Yproj
 
-                        # resid_energy is needed both for the metric (r_perp) and
-                        # the downstream edge-case gate, so keep it in the real path.
                         resid_energy = torch.linalg.norm(R, ord="fro")
 
                         _mt = time.time()
@@ -359,8 +352,8 @@ class HOBF(BaseKVCompressor):
                         if resid_energy.item() <= 1e-10:
                             _mt = time.time()
                             pca_evr[b, h] = 0.0
-                            inj_norm[b, h] = 0.0
                             pca_cum_evr[b, h, :] = 1.0
+                            inj_norm[b, h] = 0.0
                             metric_time += time.time() - _mt
                             continue
 
@@ -369,21 +362,17 @@ class HOBF(BaseKVCompressor):
                         except RuntimeError:
                             continue
 
-                        p = min(self.pca_rank, int(Vh.shape[0]))
+                        p = int(Vh.shape[0])
                         if p <= 0:
                             continue
 
-                        # Pure-diagnostic PCA statistics (S2, total_var, top_var,
-                        # pca_evr, cum_ratio, pca_cum_evr). Injection only needs
-                        # Vh[:p, :], which is independent of these.
                         _mt = time.time()
-                        S2 = S * S
-                        total_var = S2.sum() + self.eps
-                        top_var = S2[:p].sum()
+                        total_var = (S * S).sum() + self.eps
+                        top_var = (S[:p] * S[:p]).sum()
                         pca_evr[b, h] = top_var / total_var
                         # Cumulative EVR curve (per-rank). Pad tail with 1.0 if fewer
                         # singular values than head_dim D so the stored length is fixed.
-                        cum_ratio = torch.cumsum(S2, dim=0) / total_var
+                        cum_ratio = torch.cumsum(S * S, dim=0) / total_var
                         k_sv = cum_ratio.numel()
                         pca_cum_evr[b, h, :k_sv] = cum_ratio.to(torch.float32)
                         if k_sv < D:

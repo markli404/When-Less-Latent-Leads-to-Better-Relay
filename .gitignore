@@ -1,2 +1,11 @@
-# created by virtualenv automatically
-*
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.DS_Store
+venv/
+.venv/
+wandb/
+slurm_logs/
+local_logs/
+results/wandb_summary/

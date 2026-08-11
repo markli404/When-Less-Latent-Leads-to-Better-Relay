@@ -8,43 +8,50 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class LOBF(BaseKVCompressor):
+class LOBFEvr(BaseKVCompressor):
     """
-    PCA extra-subspace injection on V:
-      - Keep prompt top-k tokens (excluding sink) by aggregated attention.
-      - Discard pool = remaining prompt tokens (excluding sink & padding).
-      - For each sample & KV head:
-          1) Build subspace span(V_keep)
-          2) Compute residual R = V_disc - Proj_keep(V_disc)   (this is "components keep doesn't have")
-          3) PCA/SVD on R, keep top pca_rank components
-          4) Aggregate a residual vector delta from discarded tokens using attention weights
-          5) Inject delta into kept prompt V (uniform or attention-distributed)
+    EVR-adaptive-rank variant of LOBF (verbatim copy of LOBF.py except for the
+    per-(sample, head) rank selection — repo convention is one file per variant).
 
-    Notes:
-      - No anchor by default (this method only edits V).
-      - Logs are focused on: r_perp, recovery, PCA EVR, Ad/As, injection norm.
-      - All comments are in English (per your preference).
+    Fixed-rank LOBF uses the same pca_rank for every layer/head. Here, each
+    (sample, head) instead picks the SMALLEST rank p whose cumulative explained-
+    variance ratio (EVR) of the orthogonal residual reaches a target threshold
+    evr_tau, capped at max_rank. Heads whose residual energy is concentrated get
+    a small rank; diffuse ones get more — i.e. layer/head-dependent rank
+    allocation driven by the residual spectrum itself.
+
+    CLI convention: registered as "lobf_evr" in run.py and REUSES the --pca_rank
+    flag to carry the threshold as a percentage (pca_rank=90 -> evr_tau=0.90).
+    This keeps run.py / sweep scripts / wandb config plumbing unchanged. The
+    per-head ranks actually chosen are logged via rank_used.
     """
 
     def __init__(
         self,
         sink_size: int = 4,
         kv_budget: int = 32,
-        pca_rank: int = 8,
+        pca_rank: int = 90,               # interpreted as evr_tau percent (90 -> tau=0.90)
         eps: float = 1e-12,
         inject_mode: str = "uniform",     # {"uniform", "attn"}
         scale_mode: str = "ad_over_as",   # {"none", "ad_over_as", "ad_frac", "ad"}
         center: bool = False,             # whether to mean-center V before subspace ops
         debug_topk_heads: int = 0,        # 0 => do not print per-head topk info (keeps logs compact)
+        max_rank: int = 32,               # hard cap on the adaptive rank (matches the sweep max)
     ):
         super().__init__(sink_size=int(sink_size), kv_budget=int(kv_budget))
-        self.pca_rank = max(0, int(pca_rank))
+        self.pca_rank = max(0, int(pca_rank))        # raw value kept for config logging
+        self.evr_tau = float(self.pca_rank) / 100.0  # e.g. pca_rank=90 -> tau=0.90
+        self.max_rank = max(1, int(max_rank))
         self.eps = float(eps)
         self.inject_mode = str(inject_mode)
         self.scale_mode = str(scale_mode)
         self.center = bool(center)
         self.debug_topk_heads = int(debug_topk_heads)
 
+        if not (0.0 < self.evr_tau < 1.0):
+            raise ValueError(
+                f"lobf_evr expects --pca_rank in (0, 100) as an EVR percentage, got {self.pca_rank}"
+            )
         if self.inject_mode not in {"uniform", "attn"}:
             raise ValueError(f"inject_mode must be 'uniform' or 'attn', got {self.inject_mode}")
         if self.scale_mode not in {"none", "ad_over_as", "ad_frac", "ad"}:
@@ -443,7 +450,13 @@ class LOBF(BaseKVCompressor):
                     except RuntimeError:
                         continue
 
-                    p = min(self.pca_rank, int(Vh.shape[0]))
+                    # EVR-adaptive rank (the only change vs LOBF): smallest p
+                    # whose cumulative EVR reaches evr_tau, capped at max_rank.
+                    # (cum_sel[0] >= tau -> p=1; monotone cumsum ends at ~1.0.)
+                    S2_sel = S * S
+                    cum_sel = torch.cumsum(S2_sel, dim=0) / (S2_sel.sum() + self.eps)
+                    p = int((cum_sel < self.evr_tau).sum().item()) + 1
+                    p = min(p, self.max_rank, int(Vh.shape[0]))
                     if p <= 0:
                         continue
 

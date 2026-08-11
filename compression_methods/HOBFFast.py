@@ -8,18 +8,23 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class HOBF(BaseKVCompressor):
+class HOBFFast(BaseKVCompressor):
     """
-    HOBF with metric collection.
+    HOBF with the full SVD replaced by orthogonal subspace iteration.
 
-    This mirrors HOBF behavior while additionally returning per-layer tensors for:
-      - r_perp
-      - recovery_R
-      - recovery_cos
-      - pca_evr
-      - ad_over_as
-      - inj_norm
-    """
+    Headwise selection and the injection are byte-for-byte HOBF; the only change
+    is how the top pca_rank right singular directions of the residual are found.
+    The full SVD computes all 128 of them when the injection uses 2. Subspace
+    iteration applies R as an operator, never forms the factorization, and
+    returns the same directions to within rounding: measured on the layerwise
+    sibling, a median 7e-5 relative deviation in the injected vector with no
+    layer of 2160 beyond 1e-2, at about 7x less compression time.
+
+    Defaults (n_iter=12, oversample=10, qr_every=2) are the ones that measured
+    converged on real relay data. Lower iteration counts do not: the shipped
+    randomized variant at niter=2 sat 1.2e-2 from the exact answer on 68 percent
+    of layers, which is a different answer rather than a rounding difference.
+"""
 
     def __init__(
         self,
@@ -30,9 +35,21 @@ class HOBF(BaseKVCompressor):
         inject_mode: str = "uniform",
         scale_mode: str = "ad_over_as",
         center: bool = False,
+        n_iter: int = 12,                 # orthogonal iterations from a cold start
+        oversample: int = 10,             # extra directions carried during iteration
+        qr_every: int = 2,                # re-orthonormalise every N iterations
     ):
         super().__init__(sink_size=int(sink_size), kv_budget=int(kv_budget))
         self.pca_rank = max(0, int(pca_rank))
+        self.n_iter = max(1, int(n_iter))
+        self.oversample = max(0, int(oversample))
+        self.qr_every = max(1, int(qr_every))
+        # This class carries no analysis code at all: no explained-variance
+        # curves, no recovery cosines, no injection norms, no metadata. It is the
+        # deployable path, so the wall clock the pipeline records around it is
+        # the operator and nothing else. HOBF still computes those figures, so a
+        # like-for-like timing comparison against it must use HOBF's own returned
+        # time rather than the pipeline's wall clock.
         self.eps = float(eps)
         self.inject_mode = str(inject_mode)
         self.scale_mode = str(scale_mode)
@@ -58,15 +75,6 @@ class HOBF(BaseKVCompressor):
         if hasattr(past_key_values, "key_cache"):
             return tuple((k, v) for k, v in zip(past_key_values.key_cache, past_key_values.value_cache))
         return past_key_values
-
-    @staticmethod
-    def _nanmin_mean_max(x: torch.Tensor) -> Tuple[float, float, float]:
-        xf = x.reshape(-1)
-        mask = torch.isfinite(xf)
-        if mask.sum().item() == 0:
-            return float("nan"), float("nan"), float("nan")
-        vals = xf[mask]
-        return float(vals.min().item()), float(vals.mean().item()), float(vals.max().item())
 
     def _compute_scale(self, Ad: torch.Tensor, As: torch.Tensor) -> torch.Tensor:
         eps = self.eps
@@ -140,21 +148,11 @@ class HOBF(BaseKVCompressor):
         debug: bool = False,
         **kwargs,
     ) -> Tuple[Any, float, dict]:
-        debug_store = {
-            "r_perp": [],
-            "recovery_R": [],
-            "recovery_cos": [],
-            "pca_evr": [],
-            "ad_over_as": [],
-            "inj_norm": [],
-            "pca_cum_evr": [],
-        }
 
         t0 = time.time()
         # Accumulator for time spent on pure-diagnostic metric computation.
         # Subtracted from the total at the end so the returned compressor time
         # reflects only the real compression work (selection + SVD + injection).
-        metric_time = 0.0
 
         if past_key_values is None:
             return None, 0.0, None
@@ -275,13 +273,6 @@ class HOBF(BaseKVCompressor):
             new_k = torch.gather(k, dim=2, index=idx_exp)
             new_v = torch.gather(v, dim=2, index=idx_exp)
 
-            r_perp = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            recovery_R = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            recovery_cos = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            pca_evr = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            ad_over_as = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            inj_norm = torch.full((B, H_kv), float("nan"), device=device, dtype=torch.float32)
-            pca_cum_evr = torch.full((B, H_kv, D), float("nan"), device=device, dtype=torch.float32)
 
             if self.pca_rank > 0 and k_eff > 0:
                 for b in range(B):
@@ -295,6 +286,8 @@ class HOBF(BaseKVCompressor):
                     if topk_b.numel() == 0:
                         continue
 
+                    pend_R = []
+                    pend_meta = []
                     for h in range(H_kv):
                         kept = topk_b[h]
                         if kept.numel() == 0:
@@ -304,18 +297,12 @@ class HOBF(BaseKVCompressor):
                         selected[kept] = True
                         disc = candidates[~selected[candidates]]
                         if disc.numel() == 0:
-                            wk = prompt_scores_kv[b, h, kept].to(torch.float32)
-                            As = wk.sum()
-                            ad_over_as[b, h] = float("nan") if As.item() == 0 else 0.0
                             continue
 
                         w_keep = prompt_scores_kv[b, h, kept].to(torch.float32)
                         w_disc = prompt_scores_kv[b, h, disc].to(torch.float32)
                         As = w_keep.sum()
                         Ad = w_disc.sum()
-                        _mt = time.time()
-                        ad_over_as[b, h] = Ad / (As + self.eps)
-                        metric_time += time.time() - _mt
 
                         scale = self._compute_scale(Ad.view(1, 1), As.view(1, 1)).view(1)[0]
 
@@ -341,137 +328,105 @@ class HOBF(BaseKVCompressor):
                         Yproj = (Yc @ Q) @ Q.t()
                         R = Yc - Yproj
 
-                        # resid_energy is needed both for the metric (r_perp) and
-                        # the downstream edge-case gate, so keep it in the real path.
                         resid_energy = torch.linalg.norm(R, ord="fro")
 
-                        _mt = time.time()
-                        disc_energy = torch.linalg.norm(Yc, ord="fro")
-                        proj_energy = torch.linalg.norm(Yproj, ord="fro")
-                        r_perp[b, h] = resid_energy / (disc_energy + self.eps)
-                        recovery_R[b, h] = proj_energy / (disc_energy + self.eps)
-                        my = Yc.mean(dim=0)
-                        mp = Yproj.mean(dim=0)
-                        denom = (torch.linalg.norm(my) * torch.linalg.norm(mp) + self.eps)
-                        recovery_cos[b, h] = torch.dot(my, mp) / denom
-                        metric_time += time.time() - _mt
 
-                        if resid_energy.item() <= 1e-10:
-                            _mt = time.time()
-                            pca_evr[b, h] = 0.0
-                            inj_norm[b, h] = 0.0
-                            pca_cum_evr[b, h, :] = 1.0
-                            metric_time += time.time() - _mt
-                            continue
+                        # The tiny-residual gate used to read resid_energy back
+                        # with .item() here, which drains the GPU pipeline once
+                        # per head: 8 heads x 36 layers x 3 relay boundaries is
+                        # 864 synchronisations per sample, and it measured as
+                        # most of the gap to the layerwise sibling. The gate now
+                        # rides along to the batched stage, where one transfer
+                        # covers every head of the layer.
 
-                        try:
-                            _, S, Vh = torch.linalg.svd(R, full_matrices=False)
-                        except RuntimeError:
-                            continue
+                        # Collect the residual and defer the factorization. Every
+                        # head discards the same NUMBER of tokens, since the
+                        # selector keeps k_eff from a shared candidate set, so
+                        # the residuals stack and the iteration runs once for the
+                        # whole layer instead of once per head. Building R stays
+                        # per head: batching that step perturbs it in the last
+                        # bits and moves weakly determined subspaces, which is
+                        # measurable, while batching only the iteration is exact.
+                        pend_R.append(R)
+                        pend_meta.append((h, w_keep, w_disc, scale, resid_energy))
+                        continue
 
-                        p = min(self.pca_rank, int(Vh.shape[0]))
-                        if p <= 0:
-                            continue
+                    # ---- one batched iteration for every head of this sample ----
+                    if pend_R:
+                        R_st = torch.stack(pend_R, dim=0)            # (Hs, nd, D)
+                        Hs = int(R_st.shape[0])
+                        width = min(int(self.pca_rank) + self.oversample,
+                                    int(D), int(R_st.shape[1]))
+                        lam_st = None
+                        if width > 0:
+                            try:
+                                gen = torch.Generator(device="cpu").manual_seed(1234 + layer_idx * 97 + b)
+                                Sm = torch.randn((Hs, D, width), generator=gen,
+                                                 dtype=torch.float32).to(R_st.device)
+                                Sm, _ = torch.linalg.qr(Sm, mode="reduced")
+                                for _it in range(self.n_iter):
+                                    Sm = torch.bmm(R_st.transpose(-2, -1), torch.bmm(R_st, Sm))
+                                    if ((_it + 1) % self.qr_every == 0) or (_it == self.n_iter - 1):
+                                        Sm, _ = torch.linalg.qr(Sm, mode="reduced")
+                                M = torch.bmm(Sm.transpose(-2, -1),
+                                              torch.bmm(R_st.transpose(-2, -1), torch.bmm(R_st, Sm)))
+                                M = 0.5 * (M + M.transpose(-2, -1))
+                                lam_w, vec_w = torch.linalg.eigh(M)
+                                lam_st = lam_w.flip(-1).clamp_min(0.0)          # (Hs, width)
+                                basis_st = torch.bmm(Sm, vec_w.flip(-1))        # (Hs, D, width)
+                            except RuntimeError:
+                                lam_st = None
 
-                        # Pure-diagnostic PCA statistics (S2, total_var, top_var,
-                        # pca_evr, cum_ratio, pca_cum_evr). Injection only needs
-                        # Vh[:p, :], which is independent of these.
-                        _mt = time.time()
-                        S2 = S * S
-                        total_var = S2.sum() + self.eps
-                        top_var = S2[:p].sum()
-                        pca_evr[b, h] = top_var / total_var
-                        # Cumulative EVR curve (per-rank). Pad tail with 1.0 if fewer
-                        # singular values than head_dim D so the stored length is fixed.
-                        cum_ratio = torch.cumsum(S2, dim=0) / total_var
-                        k_sv = cum_ratio.numel()
-                        pca_cum_evr[b, h, :k_sv] = cum_ratio.to(torch.float32)
-                        if k_sv < D:
-                            pca_cum_evr[b, h, k_sv:] = 1.0
-                        metric_time += time.time() - _mt
+                        # One transfer for the whole layer instead of one per head.
+                        act = (torch.stack([m[4] for m in pend_meta]) > 1e-10).tolist()
+                        for _i, (h, w_keep, w_disc, scale, resid_energy) in enumerate(pend_meta):
+                            if not act[_i]:
+                                continue
+                            if lam_st is None:
+                                continue
+                            R = pend_R[_i]
+                            lam = lam_st[_i]
+                            basis = basis_st[_i]
+                            p = min(self.pca_rank, int(lam.numel()))
+                            if p <= 0:
+                                continue
 
-                        C = Vh[:p, :]
 
-                        wd_sum = w_disc.sum()
-                        if wd_sum.item() > self.eps:
-                            wd_norm = w_disc / (wd_sum + self.eps)
-                        else:
-                            wd_norm = torch.full_like(w_disc, 1.0 / float(max(int(w_disc.numel()), 1)))
+                            C = basis[:, :p].t()          # (p, D), orthonormal rows
 
-                        r_mean = (wd_norm.unsqueeze(0) @ R).squeeze(0)
-                        coeff = r_mean @ C.t()
-                        delta = coeff @ C
-                        delta = delta * scale
-
-                        if self.inject_mode == "uniform":
-                            patch = new_v[b, h, p0:p1, :].to(torch.float32)
-                            patch = patch + delta.unsqueeze(0)
-                            new_v[b, h, p0:p1, :] = patch.to(dtype=new_v.dtype)
-                        else:
-                            wk_sum = w_keep.sum()
-                            if wk_sum.item() > self.eps:
-                                wk_norm = w_keep / (wk_sum + self.eps)
+                            wd_sum = w_disc.sum()
+                            if wd_sum.item() > self.eps:
+                                wd_norm = w_disc / (wd_sum + self.eps)
                             else:
-                                wk_norm = torch.full_like(w_keep, 1.0 / float(max(int(w_keep.numel()), 1)))
+                                wd_norm = torch.full_like(w_disc, 1.0 / float(max(int(w_disc.numel()), 1)))
 
-                            add = wk_norm.unsqueeze(-1) * delta.unsqueeze(0)
-                            patch = new_v[b, h, p0:p1, :].to(torch.float32)
-                            patch = patch + add
-                            new_v[b, h, p0:p1, :] = patch.to(dtype=new_v.dtype)
+                            r_mean = (wd_norm.unsqueeze(0) @ R).squeeze(0)
+                            coeff = r_mean @ C.t()
+                            delta = coeff @ C
+                            delta = delta * scale
 
-                        _mt = time.time()
-                        inj_norm[b, h] = torch.linalg.norm(delta)
-                        metric_time += time.time() - _mt
+                            if self.inject_mode == "uniform":
+                                patch = new_v[b, h, p0:p1, :].to(torch.float32)
+                                patch = patch + delta.unsqueeze(0)
+                                new_v[b, h, p0:p1, :] = patch.to(dtype=new_v.dtype)
+                            else:
+                                wk_sum = w_keep.sum()
+                                if wk_sum.item() > self.eps:
+                                    wk_norm = w_keep / (wk_sum + self.eps)
+                                else:
+                                    wk_norm = torch.full_like(w_keep, 1.0 / float(max(int(w_keep.numel()), 1)))
+
+                                add = wk_norm.unsqueeze(-1) * delta.unsqueeze(0)
+                                patch = new_v[b, h, p0:p1, :].to(torch.float32)
+                                patch = patch + add
+                                new_v[b, h, p0:p1, :] = patch.to(dtype=new_v.dtype)
+
 
             new_layers.append((new_k, new_v))
 
-            _mt = time.time()
-            debug_store["r_perp"].append(r_perp)
-            debug_store["recovery_R"].append(recovery_R)
-            debug_store["recovery_cos"].append(recovery_cos)
-            debug_store["pca_evr"].append(pca_evr)
-            debug_store["ad_over_as"].append(ad_over_as)
-            debug_store["inj_norm"].append(inj_norm)
-            debug_store["pca_cum_evr"].append(pca_cum_evr)
-            metric_time += time.time() - _mt
-
-            if debug:
-                _mt = time.time()
-                rmin, rmean, rmax = self._nanmin_mean_max(r_perp)
-                rrmin, rrmean, rrmax = self._nanmin_mean_max(recovery_R)
-                rcmin, rcmean, rcmax = self._nanmin_mean_max(recovery_cos)
-                evmin, evmean, evmax = self._nanmin_mean_max(pca_evr)
-                admin, admean, admax = self._nanmin_mean_max(ad_over_as)
-                inmin, inmean, inmax = self._nanmin_mean_max(inj_norm)
-
-                print(
-                    f"[headwise-obf-metric] layer={layer_idx} sink={sink_len_common} k_eff={k_eff} "
-                    f"L_hist={L_history} L_lat={L_latent} L_new={L_new} steps={steps} "
-                    f"H_kv={H_kv} H_q={int(H_q)} "
-                    f"Ad/As(min/mean/max)={admin:.4f}/{admean:.4f}/{admax:.4f} "
-                    f"r_perp(min/mean/max)={rmin:.4f}/{rmean:.4f}/{rmax:.4f} "
-                    f"recovery_R(min/mean/max)={rrmin:.4f}/{rrmean:.4f}/{rrmax:.4f} "
-                    f"recovery_cos(min/mean/max)={rcmin:.4f}/{rcmean:.4f}/{rcmax:.4f} "
-                    f"pca_evr(min/mean/max)={evmin:.4f}/{evmean:.4f}/{evmax:.4f} "
-                    f"inj_norm(min/mean/max)={inmin:.4f}/{inmean:.4f}/{inmax:.4f} "
-                    f"mode={self.inject_mode} scale={self.scale_mode} center={int(self.center)}"
-                )
-                metric_time += time.time() - _mt
 
         if apply_sink:
             self._has_kept_sink = True
 
-        _mt = time.time()
-        metadata = {
-            "r_perp": torch.stack([x.detach().cpu() for x in debug_store["r_perp"]], dim=1),
-            "recovery_R": torch.stack([x.detach().cpu() for x in debug_store["recovery_R"]], dim=1),
-            "recovery_cos": torch.stack([x.detach().cpu() for x in debug_store["recovery_cos"]], dim=1),
-            "pca_evr": torch.stack([x.detach().cpu() for x in debug_store["pca_evr"]], dim=1),
-            "ad_over_as": torch.stack([x.detach().cpu() for x in debug_store["ad_over_as"]], dim=1),
-            "inj_norm": torch.stack([x.detach().cpu() for x in debug_store["inj_norm"]], dim=1),
-            "pca_cum_evr": torch.stack([x.detach().cpu() for x in debug_store["pca_cum_evr"]], dim=1),
-        }
-        metric_time += time.time() - _mt
-
         new_cache = DynamicCache.from_legacy_cache(tuple(new_layers))
-        return new_cache, max(0.0, (time.time() - t0) - metric_time), metadata
+        return new_cache, time.time() - t0, {}

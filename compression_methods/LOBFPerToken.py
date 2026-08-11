@@ -8,22 +8,28 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class LOBF(BaseKVCompressor):
+class LOBFPerToken(BaseKVCompressor):
     """
-    PCA extra-subspace injection on V:
-      - Keep prompt top-k tokens (excluding sink) by aggregated attention.
-      - Discard pool = remaining prompt tokens (excluding sink & padding).
-      - For each sample & KV head:
-          1) Build subspace span(V_keep)
-          2) Compute residual R = V_disc - Proj_keep(V_disc)   (this is "components keep doesn't have")
-          3) PCA/SVD on R, keep top pca_rank components
-          4) Aggregate a residual vector delta from discarded tokens using attention weights
-          5) Inject delta into kept prompt V (uniform or attention-distributed)
+    Per-token soft-assignment variant of LOBF (verbatim copy of LOBF.py except
+    for the residual aggregation/injection — repo convention: one file per variant).
+
+    LOBF aggregates ALL discarded residuals into one shared delta vector and adds
+    it to every kept value. Here each kept token j instead receives its OWN
+    residual vector:
+        A   = softmax(V_disc_c @ V_keep_c^T / sqrt(D), dim over kept)   # (nd, k)
+        R_p = proj_top-p(R)                                             # (nd, D)
+        delta_j = sum_i  wd_norm_i * A_ij * R_p_i                       # (k, D)
+    i.e. each discarded token routes its (attention-weighted, subspace-projected)
+    residual to the kept tokens most similar to it in value space. Rows of A sum
+    to 1, so the TOTAL injected mass equals LOBF's aggregated delta — only its
+    allocation across kept tokens changes.
 
     Notes:
-      - No anchor by default (this method only edits V).
-      - Logs are focused on: r_perp, recovery, PCA EVR, Ad/As, injection norm.
-      - All comments are in English (per your preference).
+      - Kept indices are sorted (LOBF line ~281) and placed contiguously in the
+        new cache, so column j of A aligns with slice position j by construction.
+      - inject_mode is accepted for signature compatibility but IGNORED: the
+        soft assignment itself decides the per-token allocation.
+      - inj_norm logs the mean per-token injection norm.
     """
 
     def __init__(
@@ -382,8 +388,9 @@ class LOBF(BaseKVCompressor):
                 scale = self._compute_scale(Ad.unsqueeze(0), As.unsqueeze(0)).squeeze(0)  # (H_kv,)
 
                 # Inject per head
-                # We will build delta_all (H_kv, D) then add to new_v[b, :, prompt_kept_offset:prompt_kept_offset+k, :]
-                delta_all = torch.zeros((H_kv, D), device=layer_device, dtype=torch.float32)
+                # Per-token variant: delta_all is (H_kv, kept_count, D) — one delta
+                # PER KEPT TOKEN, added to new_v[b, :, prompt_kept_offset:+kept_count, :].
+                delta_all = torch.zeros((H_kv, kept_count, D), device=layer_device, dtype=torch.float32)
 
                 for h in range(H_kv):
                     X = V_keep[h]  # (k, D)
@@ -476,18 +483,21 @@ class LOBF(BaseKVCompressor):
                     else:
                         wd_norm = torch.full_like(wd, 1.0 / float(max(int(wd.numel()), 1)))
 
-                    r_mean = (wd_norm.unsqueeze(0) @ R).squeeze(0)  # (D,)
-
-                    # Restrict r_mean to top-PC subspace (low-rank residual content)
-                    coeff = r_mean @ C.t()     # (p,)
-                    delta = coeff @ C          # (D,)
+                    # Per-token soft assignment (the change vs LOBF): each
+                    # discarded token routes its subspace-projected residual to
+                    # the kept tokens most similar to it in value space.
+                    Rproj = (R @ C.t()) @ C                       # (nd, D) top-p projection per residual
+                    logits = (Yc @ Xc.t()) / (float(D) ** 0.5)    # (nd, k) value-space affinity
+                    A = torch.softmax(logits, dim=-1)             # rows sum to 1 (mass-preserving)
+                    # delta_j = sum_i wd_norm_i * A_ij * Rproj_i
+                    delta_tok = (wd_norm.unsqueeze(-1) * A).t() @ Rproj  # (k, D)
 
                     # Apply per-head scale (Ad/As or other)
-                    delta = delta * scale[h]
+                    delta_tok = delta_tok * scale[h]
 
-                    delta_all[h] = delta
+                    delta_all[h] = delta_tok
                     _mt = time.time()
-                    inj_norm[b, h] = torch.linalg.norm(delta)
+                    inj_norm[b, h] = torch.linalg.norm(delta_tok, dim=-1).mean()
                     metric_time += time.time() - _mt
 
                 # Inject into kept prompt V in the NEW cache
@@ -497,19 +507,12 @@ class LOBF(BaseKVCompressor):
                     start = prompt_kept_offset
                     end = prompt_kept_offset + kept_count
                     if end <= L_new:
-                        if self.inject_mode == "uniform":
-                            # Add the same delta vector to every kept prompt token
-                            new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(torch.float32) + delta_all.unsqueeze(1)
-                            new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(v.dtype)
-                        else:
-                            # Distribute delta across kept prompt tokens by kept attention weights (per head)
-                            wk = w_keep.to(torch.float32)  # (H_kv, k)
-                            wk_sum = wk.sum(dim=-1, keepdim=True)  # (H_kv, 1)
-                            wk_norm = torch.where(wk_sum > self.eps, wk / (wk_sum + self.eps), torch.full_like(wk, 1.0 / float(max(int(wk.shape[-1]), 1))))
-                            # Add wk_norm[h, j] * delta_all[h] to token j
-                            add = wk_norm.unsqueeze(-1) * delta_all.unsqueeze(1)  # (H_kv, k, D)
-                            new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(torch.float32) + add
-                            new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(v.dtype)
+                        # Per-token deltas: delta_all (H_kv, k, D) is already
+                        # allocated per kept token (soft assignment), aligned
+                        # with the slice order. inject_mode is intentionally
+                        # ignored — the assignment IS the distribution.
+                        new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(torch.float32) + delta_all
+                        new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(v.dtype)
 
             new_layers.append((new_k, new_v))
 

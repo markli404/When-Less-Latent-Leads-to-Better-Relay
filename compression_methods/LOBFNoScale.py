@@ -167,15 +167,29 @@ class LOBFNoScale(BaseKVCompressor):
         prompt_mask: torch.Tensor,  # (B, L_prompt) right padded 0/1
         debug: bool = False,
         **kwargs,
-    ) -> Tuple[Any, float]:
+    ) -> Tuple[Any, float, dict]:
+
+        debug_store = {
+            "r_perp": [],
+            "recovery_R": [],
+            "recovery_cos": [],
+            "pca_evr": [],
+            "ad_over_as": [],
+            "inj_norm": [],
+            "pca_cum_evr": [],
+        }
 
         t0 = time.time()
+        # Accumulator for time spent on pure-diagnostic metric computation.
+        # Subtracted from the total at the end so the returned compressor time
+        # reflects only the real compression work (selection + SVD + injection).
+        metric_time = 0.0
         if past_key_values is None:
-            return None, 0.0
+            return None, 0.0, None
 
         layers = self._as_legacy_tuple(past_key_values)
         if len(layers) == 0:
-            return past_key_values, 0.0
+            return past_key_values, 0.0, None
 
         k0, _ = layers[0]
         B = int(k0.shape[0])
@@ -317,6 +331,7 @@ class LOBFNoScale(BaseKVCompressor):
             recovery_R = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             recovery_cos = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             pca_evr = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
+            pca_cum_evr = torch.full((B, H_kv, D), float("nan"), device=layer_device, dtype=torch.float32)
             ub_res_pca = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             ad_over_as = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
             inj_norm = torch.full((B, H_kv), float("nan"), device=layer_device, dtype=torch.float32)
@@ -359,7 +374,9 @@ class LOBFNoScale(BaseKVCompressor):
                 w_disc = prompt_scores_kv[b, :, disc].to(torch.float32)  # (H_kv, nd)
                 As = w_keep.sum(dim=-1)  # (H_kv,)
                 Ad = w_disc.sum(dim=-1)  # (H_kv,)
+                _mt = time.time()
                 ad_over_as[b] = Ad / (As + self.eps)
+                metric_time += time.time() - _mt
 
                 # Scale per head
                 scale = self._compute_scale(Ad.unsqueeze(0), As.unsqueeze(0)).squeeze(0)  # (H_kv,)
@@ -391,28 +408,32 @@ class LOBFNoScale(BaseKVCompressor):
 
                     # Project Yc onto span(Xc)
                     Yproj = (Yc @ Q) @ Q.t()
+                    R = Yc - Yproj  # (nd, D)
 
-                    # TODO: Change start!!!
-                    R = Yc # - Yproj  # (nd, D)
-
-                    disc_energy = torch.linalg.norm(Yc, ord="fro")
-                    proj_energy = torch.linalg.norm(Yproj, ord="fro")
+                    # resid_energy is used both for the r_perp metric and the
+                    # downstream edge-case gate, so keep it on the real path.
                     resid_energy = torch.linalg.norm(R, ord="fro")
 
+                    _mt = time.time()
+                    disc_energy = torch.linalg.norm(Yc, ord="fro")
+                    proj_energy = torch.linalg.norm(Yproj, ord="fro")
                     r_perp[b, h] = resid_energy / (disc_energy + self.eps)
                     recovery_R[b, h] = proj_energy / (disc_energy + self.eps)
-
                     # Cosine between mean(Yc) and mean(Yproj)
                     my = Yc.mean(dim=0)
                     mp = Yproj.mean(dim=0)
                     denom = (torch.linalg.norm(my) * torch.linalg.norm(mp) + self.eps)
                     recovery_cos[b, h] = torch.dot(my, mp) / denom
+                    metric_time += time.time() - _mt
 
                     # If residual is tiny, nothing meaningful to inject
                     if resid_energy.item() <= 1e-10:
+                        _mt = time.time()
                         pca_evr[b, h] = 0.0
+                        pca_cum_evr[b, h, :] = 1.0
                         ub_res_pca[b, h] = 0.0
                         inj_norm[b, h] = 0.0
+                        metric_time += time.time() - _mt
                         continue
 
                     # PCA/SVD on residual
@@ -422,18 +443,28 @@ class LOBFNoScale(BaseKVCompressor):
                     except RuntimeError:
                         continue
 
-                    total_var = (S * S).sum() + self.eps
                     p = min(self.pca_rank, int(Vh.shape[0]))
                     if p <= 0:
                         continue
 
+                    # Pure-diagnostic PCA statistics. Injection only needs Vh[:p, :].
+                    _mt = time.time()
+                    S2 = S * S
+                    total_var = S2.sum() + self.eps
                     rank_used[b, h] = float(p)
-
                     # Explained variance ratio for top-p components
-                    top_var = (S[:p] * S[:p]).sum()
+                    top_var = S2[:p].sum()
                     evr = top_var / total_var
                     pca_evr[b, h] = evr
                     ub_res_pca[b, h] = torch.sqrt(torch.clamp(1.0 - evr, min=0.0))
+                    # Cumulative EVR curve (per-rank). Pad tail with 1.0 if fewer
+                    # singular values than head_dim D so the stored length is fixed.
+                    cum_ratio = torch.cumsum(S2, dim=0) / total_var
+                    k_sv = cum_ratio.numel()
+                    pca_cum_evr[b, h, :k_sv] = cum_ratio.to(torch.float32)
+                    if k_sv < D:
+                        pca_cum_evr[b, h, k_sv:] = 1.0
+                    metric_time += time.time() - _mt
 
                     C = Vh[:p, :]  # (p, D), orthonormal rows
 
@@ -452,11 +483,13 @@ class LOBFNoScale(BaseKVCompressor):
                     delta = coeff @ C          # (D,)
 
                     # Apply per-head scale (Ad/As or other)
-                    # TODO: Change start!!!
-                    delta = delta #* scale[h]
+                    # CHANGE START
+                    delta = delta # * scale[h]
 
                     delta_all[h] = delta
+                    _mt = time.time()
                     inj_norm[b, h] = torch.linalg.norm(delta)
+                    metric_time += time.time() - _mt
 
                 # Inject into kept prompt V in the NEW cache
                 # NOTE: kept prompt tokens are placed contiguously after history+sink in our construction.
@@ -482,9 +515,23 @@ class LOBFNoScale(BaseKVCompressor):
             new_layers.append((new_k, new_v))
 
             # -----------------------------
+            # Logging stats to WanDB
+            # -----------------------------
+            _mt = time.time()
+            debug_store["r_perp"].append(r_perp)
+            debug_store["recovery_R"].append(recovery_R)
+            debug_store["recovery_cos"].append(recovery_cos)
+            debug_store["pca_evr"].append(pca_evr)
+            debug_store["ad_over_as"].append(ad_over_as)
+            debug_store["inj_norm"].append(inj_norm)
+            debug_store["pca_cum_evr"].append(pca_cum_evr)
+            metric_time += time.time() - _mt
+
+            # -----------------------------
             # Debug log (compact, decision-driving)
             # -----------------------------
             if debug:
+                _mt = time.time()
                 rmin, rmean, rmax = self._nanmin_mean_max(r_perp)
                 rrmin, rrmean, rrmax = self._nanmin_mean_max(recovery_R)
                 rcmin, rcmean, rcmax = self._nanmin_mean_max(recovery_cos)
@@ -508,9 +555,21 @@ class LOBFNoScale(BaseKVCompressor):
                     f"inj_norm(min/mean/max)={inmin:.4f}/{inmean:.4f}/{inmax:.4f} "
                     f"mode={self.inject_mode} scale={self.scale_mode} center={int(self.center)}"
                 )
+                metric_time += time.time() - _mt
 
         if apply_sink:
             self._has_kept_sink = True
 
+        _mt = time.time()
+        metadata = {
+            "r_perp": torch.stack([x.detach().cpu() for x in debug_store["r_perp"]], dim=1),
+            "recovery_R": torch.stack([x.detach().cpu() for x in debug_store["recovery_R"]], dim=1),
+            "recovery_cos": torch.stack([x.detach().cpu() for x in debug_store["recovery_cos"]], dim=1),
+            "pca_evr": torch.stack([x.detach().cpu() for x in debug_store["pca_evr"]], dim=1),
+            "ad_over_as": torch.stack([x.detach().cpu() for x in debug_store["ad_over_as"]], dim=1),
+            "inj_norm": torch.stack([x.detach().cpu() for x in debug_store["inj_norm"]], dim=1),
+            "pca_cum_evr": torch.stack([x.detach().cpu() for x in debug_store["pca_cum_evr"]], dim=1),
+        }
+        metric_time += time.time() - _mt
         new_cache = DynamicCache.from_legacy_cache(tuple(new_layers))
-        return new_cache, time.time() - t0
+        return new_cache, max(0.0, (time.time() - t0) - metric_time), metadata

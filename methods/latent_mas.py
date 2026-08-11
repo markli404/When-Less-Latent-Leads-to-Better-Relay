@@ -16,6 +16,35 @@ try:
 except ImportError:
     Cache = None
 
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _past_kv_length(past_kv) -> int:
+    if past_kv is None:
+        return 0
+    if Cache is not None and isinstance(past_kv, Cache):
+        try:
+            return int(past_kv.get_seq_length())
+        except Exception:
+            pass
+        try:
+            legacy = past_kv.to_legacy_cache()
+        except Exception:
+            return 0
+        if not legacy:
+            return 0
+        k0 = legacy[0][0]
+        return int(k0.shape[-2]) if k0 is not None else 0
+    # legacy tuple form
+    try:
+        k0 = past_kv[0][0]
+        return int(k0.shape[-2])
+    except Exception:
+        return 0
+
 class LatentMASMethod:
     def __init__(
         self,
@@ -88,6 +117,10 @@ class LatentMASMethod:
 
         # KV / mask state (assumed to be precomputed correctly by your pipeline)
         past_kv: Optional[Tuple] = None
+        # Tracks real-vs-pad for past_kv across agent handoffs so padding KVs
+        # do not leak into the next agent's attention when the compressor
+        # preserves KV length (e.g. Full).
+        past_attention_mask: Optional[torch.Tensor] = None
 
         # External position cursor (one per sample)
         pos_cursor = torch.zeros(batch_size, device=self.model.device, dtype=torch.long)
@@ -97,6 +130,12 @@ class LatentMASMethod:
 
         all_communication_overhead = 0
         all_compression_time = 0.0
+        # The compressor also reports its own time with the diagnostic blocks
+        # (explained-variance curves, recovery cosines, injection norms) taken
+        # out. Those exist for the paper's analysis and would not run in a
+        # deployment, so carrying both numbers separates the operator's cost
+        # from the cost of measuring it. all_compression_time stays the headline.
+        all_compression_core_time = 0.0
         latent_inference_time = 0.0
         text_inference_time = 0.0
         prompt_len = [0] * batch_size
@@ -164,6 +203,7 @@ class LatentMASMethod:
                 output: str,
                 *,
                 latent_steps: Optional[int] = None,
+                selection_info: Optional[Dict] = None,
         ) -> None:
             entry = {
                 "name": agent.name,
@@ -175,7 +215,18 @@ class LatentMASMethod:
             }
             if latent_steps is not None:
                 entry["latent_steps"] = latent_steps
+            if selection_info:
+                entry.update(selection_info)
             agent_traces[idx].append(entry)
+
+        def _build_selection_trace(meta: Optional[Dict], sample_idx: int) -> Optional[Dict]:
+            if not meta:
+                return None
+
+            matrix = meta.get("selected_prompt_positions_matrix")
+            if matrix is None or sample_idx >= len(matrix):
+                return None
+            return {"selected_prompt_positions_matrix": matrix[sample_idx]}
 
         def _score_item(task: str, final_text: str, item: Dict) -> Tuple[bool, str, str, Optional[str]]:
             """
@@ -225,27 +276,52 @@ class LatentMASMethod:
                     prompt_len[i] += lengths_list[i]
 
                 # ---- latent forward ----
+                _sync_if_cuda(device)
                 start = time.time()
-                past_kv, final_attention, pos_cursor = self.model.generate_latent_batch(
+                past_kv, final_attention, pos_cursor, past_attention_mask = self.model.generate_latent_batch(
                     wrapped_ids,
                     attention_mask=wrapped_mask,  # 2D only
                     pos_cursor=pos_cursor,  # (B,)
                     latent_steps=self.latent_steps,
                     past_key_values=past_kv,
+                    past_attention_mask=past_attention_mask,
                 )
-
+                _sync_if_cuda(device)
                 latent_inference_time += time.time() - start
 
                 # ---- compress ----
+                _sync_if_cuda(device)
+                start = time.time()
                 past_kv, compress_time, metadata = self.compressor.compress(
                     past_key_values=past_kv,
                     latent_steps=self.latent_steps,
                     prompt_mask=wrapped_mask,
                     all_steps_attentions=final_attention,
                 )
-                all_compression_time += compress_time
+                # If the compressor changed KV length (any pruning variant), we
+                # cannot map the tracked past_attention_mask back 1-to-1; fall
+                # back to all-ones (these pruning compressors are also the ones
+                # that naturally drop padding KVs, so the loss here is benign).
+                _cur_past_len = _past_kv_length(past_kv)
+                if (
+                    past_attention_mask is not None
+                    and _cur_past_len != int(past_attention_mask.size(1))
+                ):
+                    past_attention_mask = None
+                _sync_if_cuda(device)
+                measured_compress_time = time.time() - start
+                all_compression_time += measured_compress_time
+                if compress_time is not None:
+                    all_compression_core_time += float(compress_time)
                 metadatas.append(metadata)
-                kv_size = self.kv_size_mb(past_kv)
+                # Quantized-relay compressors (FullQuant/LOBFQuant) declare
+                # quant_bits; account the true n-bit payload for them instead of
+                # the bf16 tensor bytes. All other compressors are unchanged.
+                _qb = getattr(self.compressor, "quant_bits", None)
+                if _qb:
+                    kv_size = self.kv_size_quantized_mb(past_kv, int(_qb))
+                else:
+                    kv_size = self.kv_size_mb(past_kv)
                 all_communication_overhead += kv_size
                 peak_overhead = max(peak_overhead, kv_size)
 
@@ -261,14 +337,19 @@ class LatentMASMethod:
                         input_tokens=wrapped_tokens_batch[i],
                         output="",
                         latent_steps=self.latent_steps,
+                        selection_info=_build_selection_trace(metadata, i),
                     )
 
             else:
                 # Judger decoding stage
-                past_for_decoding = past_kv if self.latent_steps > 0 else None
+                # Even with latent_steps == 0, the prompt pass may have produced a
+                # valid (possibly compressed) prompt KV cache that judger decoding
+                # should continue from.
+                past_for_decoding = past_kv
                 judger_prompts = _maybe_add_think(prompts)
                 judger_ids, judger_mask, judger_tokens_batch = _encode_prompts(judger_prompts)
 
+                _sync_if_cuda(device)
                 start = time.time()
                 generated_batch, past_kv, pos_cursor, token_usage = self.model.generate_text_batch(
                     judger_ids,
@@ -278,8 +359,9 @@ class LatentMASMethod:
                     temperature=self.temperature,
                     top_p=self.top_p,
                     past_key_values=past_for_decoding,
+                    past_attention_mask=past_attention_mask,
                 )
-
+                _sync_if_cuda(device)
                 text_inference_time += time.time() - start
 
                 # If you need to continue after judger, uncomment the next line:
@@ -306,21 +388,24 @@ class LatentMASMethod:
         # Package results
         # ----------------------------
 
-        obf_metrics = {}
-        if metadata is not None:
-            for round_idx, meta in enumerate(metadatas):
-                obf_metrics[f"r_perp_{round_idx}"] = meta["r_perp"][i] if meta is not None else None
-                obf_metrics[f"recovery_R_{round_idx}"] = meta["recovery_R"][i] if meta is not None else None
-                obf_metrics[f"recovery_cos_{round_idx}"] = meta["recovery_cos"][i] if meta is not None else None
-                obf_metrics[f"pca_evr_{round_idx}"] = meta["pca_evr"][i] if meta is not None else None
-                obf_metrics[f"ad_over_as_{round_idx}"] = meta["ad_over_as"][i] if meta is not None else None
-                obf_metrics[f"inj_norm_{round_idx}"] = meta["inj_norm"][i] if meta is not None else None
-
         results: List[Dict] = []
         for i, item in enumerate(items):
             ok, pred, gold, error_msg = _score_item(self.task, final_texts[i], item)
             if error_msg:
                 print(error_msg)
+
+            obf_metrics = {}
+            for round_idx, meta in enumerate(metadatas):
+                if meta is None or "r_perp" not in meta:
+                    continue
+                obf_metrics[f"r_perp_{round_idx}"] = meta["r_perp"][i]
+                obf_metrics[f"recovery_R_{round_idx}"] = meta["recovery_R"][i]
+                obf_metrics[f"recovery_cos_{round_idx}"] = meta["recovery_cos"][i]
+                obf_metrics[f"pca_evr_{round_idx}"] = meta["pca_evr"][i]
+                obf_metrics[f"ad_over_as_{round_idx}"] = meta["ad_over_as"][i]
+                obf_metrics[f"inj_norm_{round_idx}"] = meta["inj_norm"][i]
+                if "pca_cum_evr" in meta:
+                    obf_metrics[f"pca_cum_evr_{round_idx}"] = meta["pca_cum_evr"][i]
 
             results.append(
                 {
@@ -333,6 +418,7 @@ class LatentMASMethod:
                     "correct": ok,
                     "communication_overhead": all_communication_overhead / batch_size,
                     "compression_time": all_compression_time / batch_size,
+                    "compression_core_time": all_compression_core_time / batch_size,
                     "latent_inference_time": latent_inference_time / batch_size,
                     "text_inference_time": text_inference_time / batch_size,
                     "prompt_len": prompt_len[i],
@@ -372,4 +458,35 @@ class LatentMASMethod:
             for t in layer:
                 if torch.is_tensor(t):
                     total_bytes += t.numel() * t.element_size()
+        return total_bytes / (1024 ** 2)
+
+    @staticmethod
+    def kv_size_quantized_mb(past_kv, quant_bits: int) -> float:
+        """True n-bit relay payload for quantized compressors.
+
+        Fake-quant keeps tensors in bf16, so numel*element_size would report the
+        UNQUANTIZED size. The real transmitted payload is numel * bits/8 plus
+        the per-group fp16 scale + zero-point metadata of the asymmetric scheme
+        used by FullQuant/LOBFQuant (K: per-(head, channel) groups over tokens;
+        V: per-(head, token) groups over channels).
+        """
+        if past_kv is None:
+            return 0.0
+
+        if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
+            layers = list(zip(past_kv.key_cache, past_kv.value_cache))
+        else:
+            layers = [tuple(layer) for layer in past_kv]
+
+        total_bytes = 0.0
+        for k, v in layers:
+            if not (torch.is_tensor(k) and torch.is_tensor(v)):
+                continue
+            B, H, L, D = k.shape
+            payload = (k.numel() + v.numel()) * quant_bits / 8.0
+            # fp16 scale + fp16 zero-point per quantization group:
+            #   K groups = B*H*D (stats over the token axis)
+            #   V groups = B*H*L (stats over the channel axis)
+            meta = (B * H * D + B * H * L) * 4.0
+            total_bytes += payload + meta
         return total_bytes / (1024 ** 2)

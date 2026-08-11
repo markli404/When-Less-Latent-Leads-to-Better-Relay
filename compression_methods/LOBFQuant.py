@@ -8,22 +8,22 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class LOBF(BaseKVCompressor):
+class LOBFQuant(BaseKVCompressor):
     """
-    PCA extra-subspace injection on V:
-      - Keep prompt top-k tokens (excluding sink) by aggregated attention.
-      - Discard pool = remaining prompt tokens (excluding sink & padding).
-      - For each sample & KV head:
-          1) Build subspace span(V_keep)
-          2) Compute residual R = V_disc - Proj_keep(V_disc)   (this is "components keep doesn't have")
-          3) PCA/SVD on R, keep top pca_rank components
-          4) Aggregate a residual vector delta from discarded tokens using attention weights
-          5) Inject delta into kept prompt V (uniform or attention-distributed)
+    OBF + quantization composition (verbatim copy of LOBF.py plus an n-bit
+    fake-quant of the relayed KV — repo convention: one file per variant).
 
-    Notes:
-      - No anchor by default (this method only edits V).
-      - Logs are focused on: r_perp, recovery, PCA EVR, Ad/As, injection norm.
-      - All comments are in English (per your preference).
+    Demonstrates that eviction+backfill (compressing the NUMBER of tokens) and
+    quantization (compressing BITS per token) are orthogonal, stackable axes:
+    LOBF first reduces positions to the budget and injects the orthogonal
+    residual, then the compressed relay payload is fake-quantized to quant_bits
+    (K: per-(head, channel) stats over tokens; V: per-(head, token) stats over
+    channels — KIVI-informed). Relative to bf16 LOBF, the transmitted bytes
+    shrink by a further 16/quant_bits.
+
+    NOTE on logging: latent_mas.py detects the `quant_bits` attribute and logs
+    avg_communication_MB as the TRUE n-bit payload (numel*bits/8 + per-group
+    fp16 scale/zero metadata) — no analytic correction needed downstream.
     """
 
     def __init__(
@@ -36,6 +36,7 @@ class LOBF(BaseKVCompressor):
         scale_mode: str = "ad_over_as",   # {"none", "ad_over_as", "ad_frac", "ad"}
         center: bool = False,             # whether to mean-center V before subspace ops
         debug_topk_heads: int = 0,        # 0 => do not print per-head topk info (keeps logs compact)
+        quant_bits: int = 8,              # relay payload precision (2/4/8)
     ):
         super().__init__(sink_size=int(sink_size), kv_budget=int(kv_budget))
         self.pca_rank = max(0, int(pca_rank))
@@ -44,11 +45,25 @@ class LOBF(BaseKVCompressor):
         self.scale_mode = str(scale_mode)
         self.center = bool(center)
         self.debug_topk_heads = int(debug_topk_heads)
+        self.quant_bits = int(quant_bits)
 
         if self.inject_mode not in {"uniform", "attn"}:
             raise ValueError(f"inject_mode must be 'uniform' or 'attn', got {self.inject_mode}")
         if self.scale_mode not in {"none", "ad_over_as", "ad_frac", "ad"}:
             raise ValueError(f"scale_mode invalid: {self.scale_mode}")
+        if self.quant_bits not in (2, 4, 8):
+            raise ValueError(f"quant_bits must be one of 2/4/8, got {self.quant_bits}")
+
+    @staticmethod
+    def _fake_quant(x: torch.Tensor, dim: int, bits: int) -> torch.Tensor:
+        """Asymmetric min-max fake quantization; statistics reduced over `dim`."""
+        levels = float(2 ** bits - 1)
+        xf = x.to(torch.float32)
+        mn = xf.amin(dim=dim, keepdim=True)
+        mx = xf.amax(dim=dim, keepdim=True)
+        scale = ((mx - mn) / levels).clamp_min(1e-10)
+        q = torch.clamp(torch.round((xf - mn) / scale), 0.0, levels)
+        return (q * scale + mn).to(x.dtype)
 
     # -----------------------------
     # Helpers
@@ -511,6 +526,12 @@ class LOBF(BaseKVCompressor):
                             new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(torch.float32) + add
                             new_v[b, :, start:end, :] = new_v[b, :, start:end, :].to(v.dtype)
 
+            # Fake-quantize the relayed (compressed + backfilled) KV to
+            # quant_bits at the relay boundary — the only change vs LOBF.
+            # K: stats over tokens (per head, channel); V: stats over channels
+            # (per head, token) — KIVI-informed axes.
+            new_k = self._fake_quant(new_k, dim=-2, bits=self.quant_bits)
+            new_v = self._fake_quant(new_v, dim=-1, bits=self.quant_bits)
             new_layers.append((new_k, new_v))
 
             # -----------------------------

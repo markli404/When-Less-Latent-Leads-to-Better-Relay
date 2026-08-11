@@ -7,8 +7,9 @@ LATENT_STEPS=40
 # 1. Dataset list "gsm8k" "gpqa" "arc_easy" "arc_challenge" "mbppplus" "humanevalplus" "medqa" "aime2024" "aime2024"
 DATASETS=("gsm8k" "gpqa" "humanevalplus" "medqa")
 
-# 2. Compressor list "full" "gonly" "layerwise" "headwise" "lobf" "hobf"
-COMPRESSORS=("full" "gonly" "layerwise" "headwise" "lobf" "hobf")
+# 2. Compressor list. lobf_fast / hobf_fast are the deployable OBF path;
+#    lobf / hobf are the exact-SVD reference. See README for the full set.
+COMPRESSORS=("full" "gonly" "layerwise" "headwise" "lobf_fast" "hobf_fast")
 
 # Environment variables
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

@@ -8,7 +8,7 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class LOBF(BaseKVCompressor):
+class LOBFBatched(BaseKVCompressor):
     """
     PCA extra-subspace injection on V:
       - Keep prompt top-k tokens (excluding sink) by aggregated attention.
@@ -381,114 +381,101 @@ class LOBF(BaseKVCompressor):
                 # Scale per head
                 scale = self._compute_scale(Ad.unsqueeze(0), As.unsqueeze(0)).squeeze(0)  # (H_kv,)
 
-                # Inject per head
-                # We will build delta_all (H_kv, D) then add to new_v[b, :, prompt_kept_offset:prompt_kept_offset+k, :]
+                # Inject, batched over KV heads.
+                #
+                # Every head in this batch item shares the same (k, D) kept block
+                # and the same (nd, D) discarded block, because kept/disc are
+                # selected per sample and not per head. That makes the entire
+                # per-head loop one set of batched linear-algebra calls, which is
+                # the only difference between this class and LOBF: the math per
+                # head is identical, and torch.linalg.qr/svd broadcast over the
+                # leading head dimension. Sign conventions on the singular
+                # vectors may differ from the unbatched path, but delta is a
+                # projection onto their span and is invariant to that.
                 delta_all = torch.zeros((H_kv, D), device=layer_device, dtype=torch.float32)
 
-                for h in range(H_kv):
-                    X = V_keep[h]  # (k, D)
-                    Y = V_disc[h]  # (nd, D)
+                if self.center:
+                    mu = V_keep.mean(dim=1, keepdim=True)  # (H_kv, 1, D)
+                    Xc_b = V_keep - mu
+                    Yc_b = V_disc - mu
+                else:
+                    Xc_b = V_keep
+                    Yc_b = V_disc
 
-                    # Optional centering (often helps with cosine pathologies, but can change semantics)
-                    if self.center:
-                        mu = X.mean(dim=0, keepdim=True)
-                        Xc = X - mu
-                        Yc = Y - mu
-                    else:
-                        Xc = X
-                        Yc = Y
+                try:
+                    Q_b, _ = torch.linalg.qr(Xc_b.transpose(-2, -1), mode="reduced")  # (H_kv, D, r)
+                    Yproj_b = (Yc_b @ Q_b) @ Q_b.transpose(-2, -1)                    # (H_kv, nd, D)
+                    R_b = Yc_b - Yproj_b
+                    U_b, S_b, Vh_b = torch.linalg.svd(R_b, full_matrices=False)
+                except RuntimeError:
+                    # Batched factorization failed for at least one head. The
+                    # unbatched path skipped only the offending head; here we
+                    # cannot tell which, so we skip injection for this sample
+                    # rather than guess. Diagnostics stay NaN, as they would for
+                    # a skipped head.
+                    U_b = S_b = Vh_b = None
 
-                    # Build orthonormal basis for span(Xc) via QR on Xc^T
-                    # Q: (D, r) where r <= k
-                    try:
-                        Q, _ = torch.linalg.qr(Xc.t(), mode="reduced")
-                    except RuntimeError:
-                        # Extremely rare numeric failure; skip this head
-                        continue
-
-                    # Project Yc onto span(Xc)
-                    Yproj = (Yc @ Q) @ Q.t()
-                    R = Yc - Yproj  # (nd, D)
-
-                    # resid_energy is used both for the r_perp metric and the
-                    # downstream edge-case gate, so keep it on the real path.
-                    resid_energy = torch.linalg.norm(R, ord="fro")
+                if Vh_b is not None:
+                    resid_energy_b = torch.linalg.norm(R_b, ord="fro", dim=(-2, -1))  # (H_kv,)
+                    active = resid_energy_b > 1e-10                                    # (H_kv,)
 
                     _mt = time.time()
-                    disc_energy = torch.linalg.norm(Yc, ord="fro")
-                    proj_energy = torch.linalg.norm(Yproj, ord="fro")
-                    r_perp[b, h] = resid_energy / (disc_energy + self.eps)
-                    recovery_R[b, h] = proj_energy / (disc_energy + self.eps)
-                    # Cosine between mean(Yc) and mean(Yproj)
-                    my = Yc.mean(dim=0)
-                    mp = Yproj.mean(dim=0)
-                    denom = (torch.linalg.norm(my) * torch.linalg.norm(mp) + self.eps)
-                    recovery_cos[b, h] = torch.dot(my, mp) / denom
+                    disc_energy_b = torch.linalg.norm(Yc_b, ord="fro", dim=(-2, -1))
+                    proj_energy_b = torch.linalg.norm(Yproj_b, ord="fro", dim=(-2, -1))
+                    r_perp[b] = resid_energy_b / (disc_energy_b + self.eps)
+                    recovery_R[b] = proj_energy_b / (disc_energy_b + self.eps)
+                    my_b = Yc_b.mean(dim=1)      # (H_kv, D)
+                    mp_b = Yproj_b.mean(dim=1)
+                    denom_b = my_b.norm(dim=-1) * mp_b.norm(dim=-1) + self.eps
+                    recovery_cos[b] = (my_b * mp_b).sum(dim=-1) / denom_b
                     metric_time += time.time() - _mt
 
-                    # If residual is tiny, nothing meaningful to inject
-                    if resid_energy.item() <= 1e-10:
+                    p = min(self.pca_rank, int(Vh_b.shape[-2]))
+
+                    # Heads whose residual is numerically zero contribute nothing
+                    # and report the degenerate diagnostics the unbatched path set.
+                    _mt = time.time()
+                    if (~active).any():
+                        idle = ~active
+                        pca_evr[b][idle] = 0.0
+                        ub_res_pca[b][idle] = 0.0
+                        inj_norm[b][idle] = 0.0
+                        pca_cum_evr[b][idle] = 1.0
+                    metric_time += time.time() - _mt
+
+                    if p > 0 and active.any():
                         _mt = time.time()
-                        pca_evr[b, h] = 0.0
-                        ub_res_pca[b, h] = 0.0
-                        inj_norm[b, h] = 0.0
-                        pca_cum_evr[b, h, :] = 1.0
+                        S2_b = S_b * S_b                                   # (H_kv, m)
+                        total_var_b = S2_b.sum(dim=-1) + self.eps          # (H_kv,)
+                        evr_b = S2_b[:, :p].sum(dim=-1) / total_var_b
+                        cum_ratio_b = torch.cumsum(S2_b, dim=-1) / total_var_b.unsqueeze(-1)
+                        k_sv = int(cum_ratio_b.shape[-1])
+                        rank_used[b][active] = float(p)
+                        pca_evr[b][active] = evr_b[active]
+                        ub_res_pca[b][active] = torch.sqrt(torch.clamp(1.0 - evr_b[active], min=0.0))
+                        pca_cum_evr[b, :, :k_sv][active] = cum_ratio_b[active].to(torch.float32)
+                        if k_sv < D:
+                            pca_cum_evr[b, :, k_sv:][active] = 1.0
                         metric_time += time.time() - _mt
-                        continue
 
-                    # PCA/SVD on residual
-                    # R = U S Vh, principal directions are rows of Vh
-                    try:
-                        U, S, Vh = torch.linalg.svd(R, full_matrices=False)
-                    except RuntimeError:
-                        continue
+                        C_b = Vh_b[:, :p, :]                               # (H_kv, p, D)
 
-                    p = min(self.pca_rank, int(Vh.shape[0]))
-                    if p <= 0:
-                        continue
+                        wd_b = w_disc                                      # (H_kv, nd)
+                        wd_sum_b = wd_b.sum(dim=-1, keepdim=True)
+                        wd_norm_b = torch.where(
+                            wd_sum_b > self.eps,
+                            wd_b / (wd_sum_b + self.eps),
+                            torch.full_like(wd_b, 1.0 / float(max(int(wd_b.shape[-1]), 1))),
+                        )
+                        r_mean_b = torch.bmm(wd_norm_b.unsqueeze(1), R_b).squeeze(1)          # (H_kv, D)
+                        coeff_b = torch.bmm(r_mean_b.unsqueeze(1), C_b.transpose(-2, -1)).squeeze(1)
+                        delta_b = torch.bmm(coeff_b.unsqueeze(1), C_b).squeeze(1)             # (H_kv, D)
+                        delta_b = delta_b * scale.unsqueeze(-1)
 
-                    # Pure-diagnostic PCA statistics. Injection only needs Vh[:p, :].
-                    _mt = time.time()
-                    S2 = S * S
-                    total_var = S2.sum() + self.eps
-                    rank_used[b, h] = float(p)
-                    # Explained variance ratio for top-p components
-                    top_var = S2[:p].sum()
-                    evr = top_var / total_var
-                    pca_evr[b, h] = evr
-                    ub_res_pca[b, h] = torch.sqrt(torch.clamp(1.0 - evr, min=0.0))
-                    # Cumulative EVR curve (per-rank). Pad tail with 1.0 if fewer
-                    # singular values than head_dim D so the stored length is fixed.
-                    cum_ratio = torch.cumsum(S2, dim=0) / total_var
-                    k_sv = cum_ratio.numel()
-                    pca_cum_evr[b, h, :k_sv] = cum_ratio.to(torch.float32)
-                    if k_sv < D:
-                        pca_cum_evr[b, h, k_sv:] = 1.0
-                    metric_time += time.time() - _mt
-
-                    C = Vh[:p, :]  # (p, D), orthonormal rows
-
-                    # Attention-weighted mean of residual vectors
-                    wd = w_disc[h]  # (nd,)
-                    wd_sum = wd.sum()
-                    if wd_sum.item() > self.eps:
-                        wd_norm = wd / (wd_sum + self.eps)
-                    else:
-                        wd_norm = torch.full_like(wd, 1.0 / float(max(int(wd.numel()), 1)))
-
-                    r_mean = (wd_norm.unsqueeze(0) @ R).squeeze(0)  # (D,)
-
-                    # Restrict r_mean to top-PC subspace (low-rank residual content)
-                    coeff = r_mean @ C.t()     # (p,)
-                    delta = coeff @ C          # (D,)
-
-                    # Apply per-head scale (Ad/As or other)
-                    delta = delta * scale[h]
-
-                    delta_all[h] = delta
-                    _mt = time.time()
-                    inj_norm[b, h] = torch.linalg.norm(delta)
-                    metric_time += time.time() - _mt
+                        delta_all = torch.where(active.unsqueeze(-1), delta_b, delta_all)
+                        _mt = time.time()
+                        inj_norm[b][active] = torch.linalg.norm(delta_all, dim=-1)[active]
+                        metric_time += time.time() - _mt
 
                 # Inject into kept prompt V in the NEW cache
                 # NOTE: kept prompt tokens are placed contiguously after history+sink in our construction.

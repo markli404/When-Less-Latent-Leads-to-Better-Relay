@@ -32,7 +32,7 @@ class Full(BaseKVCompressor):
 
         # If no cache, return an empty DynamicCache to keep downstream code consistent
         if past_key_values is None:
-            return DynamicCache(), time.time() - t0
+            return DynamicCache(), time.time() - t0, None
 
         # Return KV unchanged
         return past_key_values, time.time() - t0, None

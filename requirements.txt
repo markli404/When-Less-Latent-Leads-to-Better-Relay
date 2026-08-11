@@ -1,6 +1,27 @@
-transformers
-torch
-numpy
-tqdm
-accelerate
-datasets
+# Exact environment used for all reported experiments (Python 3.10.20).
+#
+# IMPORTANT -- transformers version:
+#   The code relies on the legacy DynamicCache interface (key_cache / value_cache
+#   and tuple-style past_key_values). transformers 4.57.3 still exposes this.
+#   Newer releases (4.58+) switch to past_key_values.layers[i].keys/.values and
+#   break the KV-relay compression code. Pin transformers==4.57.3.
+#
+# torch is the CUDA 12.8 build (torch 2.9.0+cu128). The bare `torch==2.9.0`
+# below resolves to the CPU wheel on PyPI, so for GPU install torch first:
+#   pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+# then `pip install -r requirements.txt` for the rest.
+
+transformers==4.57.3
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+safetensors==0.7.0
+accelerate==1.13.0
+
+torch==2.9.0
+
+datasets==4.4.1
+numpy==2.2.6
+pandas==2.3.3
+
+wandb==0.26.1
+tqdm==4.67.1

@@ -8,28 +8,35 @@ from transformers import DynamicCache
 from compression_methods.BaseKVCompressor import BaseKVCompressor
 
 
-class Layerwise(BaseKVCompressor):
+class LMerge(BaseKVCompressor):
     """
-    Physical KV slicing with a fixed per-sample budget (no cache padding, no masks).
+    Token-merging baseline: Layerwise selection + one-by-one CaM/KVMerger-style
+    merging (verbatim copy of Layerwise.py plus the merge step — repo
+    convention: one file per variant).
 
-    KV layout (shared across batch):
-      [ history | prompt(padded) | latent_tail ]
-    - history length is shared across batch
-    - latent_tail length == latent_steps (shared)
-    - prompt is right padded, described by prompt_mask (B, L_prompt)
+    Same layerwise top-k selection as Layerwise / L-OBF (identical budget, so
+    results are directly comparable). Instead of hard-discarding the evicted
+    prompt tokens, EACH discarded token is matched one-by-one to its most
+    similar kept token by KEY cosine similarity (the standard matching rule of
+    ToMe / KVMerger / D2O — keys decide addressing, so key-similar tokens are
+    retrieved by similar queries and merging their values is coherent), and the
+    kept VALUE is replaced by the attention-weighted average of its merge group:
 
-    Per layer keep:
-      - keep all history
-      - keep sink tokens only once (first compress call after reset) in the prompt region
-      - keep exactly k_eff prompt tokens per sample (exclude padding, exclude sink region)
-      - keep all latent_tail
+        j*(i) = argmax_j cos(K_disc_i, K_keep_j)                    (per KV head)
+        V_new_j = (a_j V_j + sum_{i: j*(i)=j} a_i V_i) / (a_j + sum a_i)
 
-    Note:
-      - k_eff is batch-constant so the kept KV length is identical across samples.
+    where a are aggregated attention masses. Keys are NOT merged (cached keys
+    are post-RoPE; averaging them mixes rotations — same argument as OBF's
+    value-only design, kept consistent across the paper).
+
+    The external token-merging baseline: unlike OBF it has no SVD cost, but
+    replaces kept content instead
+    of injecting the orthogonal residual.
     """
 
-    def __init__(self, sink_size: int = 4, kv_budget: int = 32):
+    def __init__(self, sink_size: int = 4, kv_budget: int = 32, eps: float = 1e-12):
         super().__init__(sink_size=int(sink_size), kv_budget=int(kv_budget))
+        self.eps = float(eps)
 
     @staticmethod
     def _past_length(past_key_values: Any) -> int:
@@ -227,12 +234,73 @@ class Layerwise(BaseKVCompressor):
             new_k = torch.empty((B, H_kv, L_new, D), device=layer_device, dtype=k.dtype)
             new_v = torch.empty((B, H_kv, L_new, D), device=layer_device, dtype=v.dtype)
 
+            # Kept prompt tokens sit contiguously at this offset in the new cache
+            # (same construction as LOBF), so merge results can be written back
+            # positionally.
+            prompt_kept_offset = L_history + sink_len_common
+            kept_count = k_eff
+
             for b in range(B):
                 ix = full_indices[b]
                 # Ensure index on the same device
                 ix = ix.to(device=layer_device, dtype=torch.long, non_blocking=True)
                 new_k[b] = k[b].index_select(dim=-2, index=ix)
                 new_v[b] = v[b].index_select(dim=-2, index=ix)
+
+                # -------------------------------------------------------------
+                # Merge step (the change vs Layerwise): route each discarded
+                # prompt token to its most key-similar kept token and replace
+                # the kept VALUE with the attention-weighted group average.
+                # -------------------------------------------------------------
+                kept = kept_prompt_idx[b]
+                vp = int(valid_prompt_len[b].item())
+                if kept.numel() == 0 or kept_count <= 0:
+                    continue
+
+                # Discard pool = valid prompt positions minus sink minus kept.
+                is_kept = torch.zeros((vp,), device=layer_device, dtype=torch.bool)
+                is_kept[kept] = True
+                all_valid = torch.arange(sink_len_common, vp, device=layer_device, dtype=torch.long)
+                disc = all_valid[~is_kept[all_valid]]
+                if disc.numel() == 0:
+                    continue
+
+                kept_abs = (kept + L_history).to(torch.long)
+                disc_abs = (disc + L_history).to(torch.long)
+
+                K_keep = k[b].index_select(dim=-2, index=kept_abs).to(torch.float32)  # (H_kv, kc, D)
+                K_disc = k[b].index_select(dim=-2, index=disc_abs).to(torch.float32)  # (H_kv, nd, D)
+                V_keep = v[b].index_select(dim=-2, index=kept_abs).to(torch.float32)
+                V_disc = v[b].index_select(dim=-2, index=disc_abs).to(torch.float32)
+
+                w_keep = prompt_scores_kv[b, :, kept].to(torch.float32)  # (H_kv, kc)
+                w_disc = prompt_scores_kv[b, :, disc].to(torch.float32)  # (H_kv, nd)
+
+                for h in range(H_kv):
+                    # Attention-mass merge weights; degenerate all-zero weights
+                    # fall back to uniform so kept content is never zeroed out.
+                    a_keep = w_keep[h]
+                    a_disc = w_disc[h]
+                    if a_keep.sum().item() <= self.eps:
+                        a_keep = torch.ones_like(a_keep)
+                    if a_disc.sum().item() <= self.eps:
+                        a_disc = torch.ones_like(a_disc)
+
+                    # One-by-one matching by KEY cosine similarity.
+                    Kk = F.normalize(K_keep[h], dim=-1)
+                    Kd = F.normalize(K_disc[h], dim=-1)
+                    jstar = (Kd @ Kk.t()).argmax(dim=-1)  # (nd,)
+
+                    num = a_keep.unsqueeze(-1) * V_keep[h]           # (kc, D)
+                    den = a_keep.clone()                              # (kc,)
+                    num.index_add_(0, jstar, a_disc.unsqueeze(-1) * V_disc[h])
+                    den.index_add_(0, jstar, a_disc)
+                    V_new = num / den.clamp_min(self.eps).unsqueeze(-1)
+
+                    start = prompt_kept_offset
+                    end = prompt_kept_offset + kept_count
+                    if end <= L_new and V_new.shape[0] == kept_count:
+                        new_v[b, h, start:end, :] = V_new.to(v.dtype)
 
             layer_selection: List[List[List[int]]] = []
             for b in range(B):
